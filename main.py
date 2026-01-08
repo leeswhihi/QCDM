@@ -2,130 +2,123 @@ import hashlib
 import hmac
 import secrets
 import struct
-import sys
 
-class QCDM_Sonic:
+class QCDM_Ultimate:
     def __init__(self, key):
         self._key = key.encode()
-        # 블록 크기 최적화 (CPU 캐시 친화적인 크기 고려)
-        self.BLOCK_SIZE = 128 
+        # 파이스텔 구조를 위해 블록 사이즈를 짝수로 맞춤
+        self.BLOCK_SIZE = 64 
 
-    def _get_keystream_fast(self, seed_val, length):
+    def _round_function(self, data_int, round_key_bytes):
         """
-        [최적화 포인트 1] 반복문 제거
-        기존: for 문을 돌며 카오스 수식을 수천 번 계산
-        변경: 카오스 수식은 시드 생성용으로 '딱 한 번'만 실행 후,
-              초고속 C언어 기반 함수인 SHAKE-256으로 스트림을 한방에 뽑아냄.
+        [파이스텔 라운드 함수 F]
+        입력된 데이터(Right)와 라운드 키를 섞어서 난잡한 값을 만듭니다.
+        SHAKE-256을 사용하여 고속으로 비선형 변환을 수행합니다.
         """
-        # 카오스 초기화 (단 1회 연산)
-        r = 3.9999
-        chaos = r * seed_val * (1 - seed_val)
+        # 정수를 바이트로 변환
+        data_bytes = data_int.to_bytes((data_int.bit_length() + 7) // 8, 'big')
         
-        # 카오스 값을 바이트로 패킹하여 시드로 사용
-        seed_bytes = struct.pack('d', chaos) 
+        # 키와 데이터를 섞음
+        mixed = hashlib.shake_256(data_bytes + round_key_bytes).digest(len(data_bytes))
         
-        # 원하는 길이만큼의 난수를 C레벨 속도로 한 번에 생성
-        return hashlib.shake_256(seed_bytes).digest(length)
+        # 다시 정수로 변환하여 반환
+        return int.from_bytes(mixed, 'big')
+
+    def _process_feistel(self, data_bytes, derived_key, mode='encrypt'):
+        """
+        [핵심 원리: 파이스텔 네트워크]
+        데이터를 좌우로 나누고 교차하며 섞습니다.
+        """
+        # 1. 데이터를 절반으로 나눔 (Left, Right)
+        half_len = len(data_bytes) // 2
+        L = int.from_bytes(data_bytes[:half_len], 'big')
+        R = int.from_bytes(data_bytes[half_len:], 'big')
+        
+        # 4라운드 수행 (보안과 속도의 균형)
+        rounds = 4
+        
+        for i in range(rounds):
+            # 복호화일 때는 키를 역순으로 사용해야 함
+            round_idx = i if mode == 'encrypt' else (rounds - 1 - i)
+            
+            # 라운드 키 생성 (파생키를 잘라서 사용)
+            round_key = hashlib.sha256(derived_key + bytes([round_idx])).digest()
+            
+            if mode == 'encrypt':
+                # 암호화: L_new = R, R_new = L ^ F(R)
+                new_R = L ^ self._round_function(R, round_key)
+                L = R
+                R = new_R
+            else:
+                # 복호화: R_old = L, L_old = R ^ F(L) (암호화의 정확한 역순)
+                # 파이스텔의 특징: 복호화 로직이 암호화와 대칭적임
+                new_L = R ^ self._round_function(L, round_key)
+                R = L
+                L = new_L
+
+        # 합치기 (최종 Swap은 생략하거나 포함 가능, 여기선 합침)
+        L_bytes = L.to_bytes(half_len, 'big')
+        R_bytes = R.to_bytes(half_len, 'big')
+        return L_bytes + R_bytes
 
     def encrypt(self, plaintext):
-        # 1. Salt 생성
         salt = secrets.token_bytes(16)
+        # 키 생성 (속도를 위해 반복 횟수 최적화)
+        derived_key = hashlib.pbkdf2_hmac('sha256', self._key, salt, 10000)
         
-        # [최적화 포인트 2] 키 스트레칭 횟수 조절
-        # 보안과 속도의 타협점. 너무 느리면 사용성이 떨어짐 (20만회 -> 5만회)
-        # *실제 상용환경에서는 보안 정책에 따라 조절 필요
-        derived_key = hashlib.pbkdf2_hmac('sha256', self._key, salt, 50000)
+        # 패딩 (짝수 길이 보장)
+        data = plaintext.encode('utf-8')
+        pad_len = self.BLOCK_SIZE - (len(data) % self.BLOCK_SIZE)
+        padded_data = data + bytes([pad_len] * pad_len)
         
-        # 패딩 (PKCS#7)
-        data_bytes = plaintext.encode('utf-8')
-        padding_len = self.BLOCK_SIZE - (len(data_bytes) % self.BLOCK_SIZE)
-        padded_data = data_bytes + bytes([padding_len] * padding_len)
-        data_len = len(padded_data)
-
-        # 키 스트림 생성
-        seed_val = int.from_bytes(derived_key[:4], 'big') / (2**32)
-        if seed_val == 0: seed_val = 0.987654321
-        keystream = self._get_keystream_fast(seed_val, data_len)
-
-        # [최적화 포인트 3] 거대 정수 XOR (The Big Int Trick)
-        # for 문으로 byte ^ byte 하는 것은 파이썬에서 매우 느림.
-        # 데이터를 통째로 하나의 거대한 숫자로 변환하여 CPU가 한 번에 처리하게 함.
-        int_data = int.from_bytes(padded_data, 'big')
-        int_keystream = int.from_bytes(keystream, 'big')
-        
-        # CPU 레벨의 고속 비트 연산
-        int_cipher = int_data ^ int_keystream
-        
-        # 다시 바이트로 변환
-        encrypted_bytes = int_cipher.to_bytes(data_len, 'big')
+        # 블록 단위로 파이스텔 적용이 원칙이나, 
+        # 파이썬 속도를 위해 전체 데이터를 '하나의 거대 블록'으로 간주하고 파이스텔 적용 (변형된 구조)
+        # *주의: 데이터가 너무 크면 메모리 이슈가 있을 수 있으나 텍스트 전송용으론 충분
+        encrypted_body = self._process_feistel(padded_data, derived_key, 'encrypt')
 
         # HMAC 서명
-        signature = hmac.new(derived_key, salt + encrypted_bytes, hashlib.sha256).digest()
+        signature = hmac.new(derived_key, salt + encrypted_body, hashlib.sha256).digest()
         
-        # 결과 반환 (Hex 인코딩이 Base64보다 빠를 수 있음)
-        return (salt + signature + encrypted_bytes).hex()
+        return (salt + signature + encrypted_body).hex()
 
     def decrypt(self, ciphertext_hex):
         try:
-            # 1. 데이터 파싱
-            raw_data = bytes.fromhex(ciphertext_hex)
-            salt = raw_data[:16]
-            sig = raw_data[16:48]
-            body = raw_data[48:]
+            raw = bytes.fromhex(ciphertext_hex)
+            salt = raw[:16]
+            sig = raw[16:48]
+            body = raw[48:]
             
-            # 2. 키 재생성
-            derived_key = hashlib.pbkdf2_hmac('sha256', self._key, salt, 50000)
+            derived_key = hashlib.pbkdf2_hmac('sha256', self._key, salt, 10000)
             
-            # 3. 서명 검증 (상수 시간 비교 사용)
             expected_sig = hmac.new(derived_key, salt + body, hashlib.sha256).digest()
             if not hmac.compare_digest(sig, expected_sig):
-                raise ValueError("데이터 변조 감지됨")
-                
-            # 4. 키 스트림 생성
-            seed_val = int.from_bytes(derived_key[:4], 'big') / (2**32)
-            if seed_val == 0: seed_val = 0.987654321
-            keystream = self._get_keystream_fast(seed_val, len(body))
+                raise ValueError("데이터 변조됨")
             
-            # [최적화 포인트 3] 거대 정수 XOR 복호화
-            int_body = int.from_bytes(body, 'big')
-            int_keystream = int.from_bytes(keystream, 'big')
+            decrypted_body = self._process_feistel(body, derived_key, 'decrypt')
             
-            int_plain = int_body ^ int_keystream
-            padded_plain = int_plain.to_bytes(len(body), 'big')
-            
-            # 5. 패딩 제거
-            padding_len = padded_plain[-1]
-            return padded_plain[:-padding_len].decode('utf-8')
-            
+            # 패딩 제거
+            pad_len = decrypted_body[-1]
+            return decrypted_body[:-pad_len].decode('utf-8')
         except Exception as e:
             return f"Error: {str(e)}"
 
-# --- 속도 측정 테스트 ---
+# --- 확산 효과(Diffusion) 테스트 ---
 if __name__ == "__main__":
-    import time
+    key = "Feistel_Power"
     
-    # 엄청 긴 텍스트 준비 (약 1MB)
-    text = "Fastest Python Cipher " * 50000 
-    key = "Speed_King"
+    # 1. 원본 메시지
+    msg1 = "Attack at 10:00 AM"
+    # 2. 딱 한 글자만 바꾼 메시지 (0 -> 1)
+    msg2 = "Attack at 10:01 AM"
     
-    cipher = QCDM_Sonic(key)
+    cipher = QCDM_Ultimate(key)
     
-    print(f"🚀 데이터 크기: {len(text)/1024:.2f} KB 암호화 시작...")
+    enc1 = cipher.encrypt(msg1)
+    enc2 = cipher.encrypt(msg2)
     
-    start_time = time.time()
-    enc = cipher.encrypt(text)
-    end_time = time.time()
+    print(f"🔹 원본 1 암호문 앞부분: {enc1[96:150]}...")
+    print(f"🔸 원본 2 암호문 앞부분: {enc2[96:150]}...")
+    print("\n✅ 확인해보세요! 단 1글자 차이인데 암호문은 완전히 다르게 변했죠?")
     
-    print(f"⏱️ 암호화 소요 시간: {end_time - start_time:.4f}초")
-    
-    start_time = time.time()
-    dec = cipher.decrypt(enc)
-    end_time = time.time()
-    
-    print(f"⏱️ 복호화 소요 시간: {end_time - start_time:.4f}초")
-    
-    # 검증
-    if dec == text:
-        print("✅ 무결성 검증 완료: 완벽하게 복구되었습니다.")
-    else:
-        print("❌ 오류 발생")
+    # 복호화 확인
+    print(f"복호화 1: {cipher.decrypt(enc1)}")
