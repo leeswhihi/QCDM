@@ -3,155 +3,162 @@ import hmac
 import secrets
 import os
 import struct
+import zlib  # [New] 데이터 압축 라이브러리
 
-class QCDM_Omega:
+class QCDM_Singularity:
     def __init__(self, key):
         self._key = key.encode()
-        self.CHUNK_SIZE = 64 * 1024  # 64KB 단위로 처리 (I/O 속도 최적화)
+        self.CHUNK_SIZE = 64 * 1024 # 64KB
 
     def _get_chunk_keystream(self, seed_val, length):
-        """
-        [최적화] 청크 단위 키 스트림 생성
-        """
+        # 카오스 + SHAKE256 하이브리드 키 스트림
         r = 3.9999
         chaos = r * seed_val * (1 - seed_val)
         seed_bytes = struct.pack('d', chaos)
         return hashlib.shake_256(seed_bytes).digest(length)
 
     def encrypt_file(self, input_path, output_path):
-        """
-        [마지막 원리: 스트리밍]
-        파일을 조금씩 읽어서 암호화하므로, 메모리가 터지지 않습니다.
-        """
         salt = secrets.token_bytes(16)
         derived_key = hashlib.pbkdf2_hmac('sha256', self._key, salt, 50000)
         
-        # 카오스 시드 초기화
         seed_val = int.from_bytes(derived_key[:4], 'big') / (2**32)
         if seed_val == 0: seed_val = 0.123456789
 
-        # HMAC 계산을 위한 객체 (스트리밍 방식)
         hmac_obj = hmac.new(derived_key, salt, hashlib.sha256)
-
-        file_size = os.path.getsize(input_path)
         
+        # [New] 압축 객체 생성
+        compressor = zlib.compressobj(level=6) 
+
+        file_size_original = os.path.getsize(input_path)
+        print(f"🔄 작업 시작: {input_path} ({file_size_original:,} bytes)")
+
         with open(input_path, 'rb') as f_in, open(output_path, 'wb') as f_out:
-            # 1. 헤더 쓰기 (Salt)
             f_out.write(salt)
+            f_out.write(b'\x00' * 32) # 서명 공간 확보
             
-            # 2. 서명을 위한 자리 비워두기 (나중에 덮어씀)
-            f_out.write(b'\x00' * 32)
-            
-            processed = 0
             chunk_index = 0
             
-            print(f"🔄 암호화 시작: {input_path} ({file_size/1024/1024:.2f} MB)")
-            
-            while True:
-                chunk = f_in.read(self.CHUNK_SIZE)
-                if not chunk:
-                    break
+            def process_and_write(raw_data):
+                nonlocal chunk_index, seed_val
                 
-                # 청크마다 미세하게 변하는 시드값 (패턴 반복 방지)
-                # 시드가 고정되면 모든 청크가 같은 키로 암호화되는 취약점 발생 -> 인덱스 섞음
+                # 데이터가 비어있으면 패스
+                if not raw_data: return
+
+                # 시드 변형
                 chunk_seed = seed_val + (chunk_index * 0.0000001)
                 while chunk_seed > 1: chunk_seed -= 1
                 
-                keystream = self._get_chunk_keystream(chunk_seed, len(chunk))
+                # 키 스트림 생성 및 암호화
+                keystream = self._get_chunk_keystream(chunk_seed, len(raw_data))
                 
-                # 고속 XOR (청크 단위 Big Int 변환)
-                int_chunk = int.from_bytes(chunk, 'big')
+                int_data = int.from_bytes(raw_data, 'big')
                 int_key = int.from_bytes(keystream, 'big')
-                int_cipher = int_chunk ^ int_key
+                cipher_chunk = (int_data ^ int_key).to_bytes(len(raw_data), 'big')
                 
-                cipher_bytes = int_cipher.to_bytes(len(chunk), 'big')
-                
-                # 파일 쓰기
-                f_out.write(cipher_bytes)
-                
-                # HMAC 업데이트 (메모리에 다 올리지 않고 누적 계산)
-                hmac_obj.update(cipher_bytes)
-                
-                processed += len(chunk)
+                f_out.write(cipher_chunk)
+                hmac_obj.update(cipher_chunk)
                 chunk_index += 1
+
+            while True:
+                chunk = f_in.read(self.CHUNK_SIZE)
+                if not chunk: break
                 
-            # 3. 최종 서명 계산 및 헤더 업데이트
-            signature = hmac_obj.digest()
-            f_out.seek(16) # Salt 다음 위치로 이동
-            f_out.write(signature) # 서명 기록
+                # 1. 읽은 데이터를 압축
+                compressed_chunk = compressor.compress(chunk)
+                
+                # 2. 압축된 데이터가 나오면 암호화해서 저장
+                if compressed_chunk:
+                    process_and_write(compressed_chunk)
             
-        print("✅ 암호화 완료!")
+            # 3. 남은 압축 데이터 처리 (Flush)
+            remaining = compressor.flush()
+            if remaining:
+                process_and_write(remaining)
+
+            # 서명 기록
+            signature = hmac_obj.digest()
+            f_out.seek(16)
+            f_out.write(signature)
+            
+        final_size = os.path.getsize(output_path)
+        ratio = (1 - final_size/file_size_original) * 100
+        print(f"✅ 완료! 크기: {final_size:,} bytes (압축률: {ratio:.1f}%)")
 
     def decrypt_file(self, input_path, output_path):
         with open(input_path, 'rb') as f_in:
-            # 헤더 읽기
             salt = f_in.read(16)
             expected_sig = f_in.read(32)
             
             derived_key = hashlib.pbkdf2_hmac('sha256', self._key, salt, 50000)
-            
-            # HMAC 검증을 위한 객체
             hmac_verify = hmac.new(derived_key, salt, hashlib.sha256)
             
-            # 본문 시작 위치 기억
             body_start = f_in.tell()
             
-            # 1. 무결성 검증 (먼저 파일을 끝까지 읽어서 서명 확인)
-            # *보안상 복호화 전에 변조 여부 확인이 필수
-            print("🔍 무결성 검증 중...")
+            # 무결성 검증
+            print("🔍 파일 무결성 검증 중...")
             while True:
                 chunk = f_in.read(self.CHUNK_SIZE)
                 if not chunk: break
                 hmac_verify.update(chunk)
                 
             if not hmac.compare_digest(hmac_verify.digest(), expected_sig):
-                print("🚨 경고: 파일이 변조되었습니다! 복호화를 중단합니다.")
+                print("🚨 오류: 파일이 손상되었습니다.")
                 return
 
-            # 2. 검증 완료 후 다시 처음으로 돌아가서 복호화 수행
+            # 복호화 및 압축 해제 시작
             f_in.seek(body_start)
             seed_val = int.from_bytes(derived_key[:4], 'big') / (2**32)
             if seed_val == 0: seed_val = 0.123456789
             
+            # [New] 압축 해제 객체
+            decompressor = zlib.decompressobj()
+            
             chunk_index = 0
+            
             with open(output_path, 'wb') as f_out:
                 while True:
-                    chunk = f_in.read(self.CHUNK_SIZE)
-                    if not chunk: break
+                    cipher_chunk = f_in.read(self.CHUNK_SIZE)
+                    if not cipher_chunk: break
                     
                     chunk_seed = seed_val + (chunk_index * 0.0000001)
                     while chunk_seed > 1: chunk_seed -= 1
                     
-                    keystream = self._get_chunk_keystream(chunk_seed, len(chunk))
+                    keystream = self._get_chunk_keystream(chunk_seed, len(cipher_chunk))
                     
-                    int_chunk = int.from_bytes(chunk, 'big')
+                    int_cipher = int.from_bytes(cipher_chunk, 'big')
                     int_key = int.from_bytes(keystream, 'big')
-                    int_plain = int_chunk ^ int_key
+                    compressed_data = (int_cipher ^ int_key).to_bytes(len(cipher_chunk), 'big')
                     
-                    plain_bytes = int_plain.to_bytes(len(chunk), 'big')
-                    f_out.write(plain_bytes)
+                    # 1. 복호화된 데이터를 압축 해제기에 넣음
+                    decompressed_chunk = decompressor.decompress(compressed_data)
+                    
+                    # 2. 압축 해제된 원본 데이터 저장
+                    if decompressed_chunk:
+                        f_out.write(decompressed_chunk)
                     
                     chunk_index += 1
-                    
-        print("✅ 복호화 완료!")
+                
+                # 남은 데이터 처리
+                f_out.write(decompressor.flush())
+                
+        print("✅ 복호화 및 복원 완료!")
 
-# --- 사용 예시 ---
+# --- 최종 테스트 ---
 if __name__ == "__main__":
-    # 테스트를 위한 더미 파일 생성 (10MB)
-    dummy_file = "test_video.mp4"
-    with open(dummy_file, "wb") as f:
-        f.write(os.urandom(10 * 1024 * 1024))
+    # 테스트용 파일 생성 (반복되는 내용이 많아 압축 효과가 좋은 파일)
+    sample_text = "이것은 최고의 암호화 알고리즘입니다. " * 100000
+    with open("secret_doc.txt", "w", encoding='utf-8') as f:
+        f.write(sample_text)
         
-    key = "Final_Key_Omega"
-    cipher = QCDM_Omega(key)
+    cipher = QCDM_Singularity("My_Final_Password")
     
-    # 파일 암호화
-    cipher.encrypt_file(dummy_file, "encrypted.qcdm")
+    # 암호화 (압축 효과 확인)
+    cipher.encrypt_file("secret_doc.txt", "secret.qcdm")
     
-    # 파일 복호화
-    cipher.decrypt_file("encrypted.qcdm", "restored_video.mp4")
+    # 복호화
+    cipher.decrypt_file("secret.qcdm", "recovered_doc.txt")
     
     # 정리
-    os.remove(dummy_file)
-    os.remove("encrypted.qcdm")
-    os.remove("restored_video.mp4")
+    os.remove("secret_doc.txt")
+    os.remove("secret.qcdm")
+    os.remove("recovered_doc.txt")
