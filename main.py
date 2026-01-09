@@ -22,19 +22,13 @@ class QCDM_Smart:
         return hashlib.shake_256(chunk_seed).digest(length)
 
     def process_file(self, mode, input_path, output_path=None):
-        """
-        output_path가 None이면, 내부에서 확장자를 읽어 자동으로 결정합니다.
-        """
         if mode == 'encrypt':
-            # 1. 원본 확장자 추출 (예: .pdf)
+            # 1. 원본 확장자 추출
             file_ext = os.path.splitext(input_path)[1]
             ext_bytes = file_ext.encode('utf-8')
             ext_len = len(ext_bytes)
             
-            # 출력 파일명이 없으면 자동 생성 (.qcdm 붙이기)
             if not output_path:
-                # 확장자 없는 파일명만 추출해서 .qcdm 붙임
-                # 예: report.pdf -> report.qcdm (중간에 .pdf 안 보이게)
                 base_name = os.path.splitext(os.path.basename(input_path))[0]
                 output_path = base_name + ".qcdm"
 
@@ -49,14 +43,10 @@ class QCDM_Smart:
             encrypt_buffer = bytearray()
             
             with open(output_path, 'wb') as f_out:
-                # [헤더 구조]
-                # Salt(16) + Sig(32) + Ext_Len(1) + Ext_Bytes(N)
                 f_out.write(salt)
-                f_out.write(b'\x00' * 32) # 서명 예약
-                
-                # 확장자 정보 기록 및 서명에 포함
-                f_out.write(struct.pack('B', ext_len)) # 길이 1바이트
-                f_out.write(ext_bytes)                 # 확장자 내용
+                f_out.write(b'\x00' * 32)
+                f_out.write(struct.pack('B', ext_len))
+                f_out.write(ext_bytes)
                 
                 hmac_obj.update(struct.pack('B', ext_len))
                 hmac_obj.update(ext_bytes)
@@ -89,7 +79,9 @@ class QCDM_Smart:
                 
                 f_out.seek(16)
                 f_out.write(hmac_obj.digest())
-                print(f"✅ 암호화 완료: {output_path}")
+                
+            # [수정] 이 프린트문은 이제 encrypt 블록 안에 안전하게 있습니다.
+            print(f"✅ 암호화 완료: {output_path}")
                 
         elif mode == 'decrypt':
             print(f"🔓 복호화 준비 중...")
@@ -101,27 +93,21 @@ class QCDM_Smart:
                 main_seed = hashlib.sha256(derived_key).digest()
                 hmac_verify = hmac.new(derived_key, salt, hashlib.sha256)
                 
-                # [스마트 복구] 확장자 정보 읽기
                 ext_len = struct.unpack('B', f_in.read(1))[0]
                 ext_bytes = f_in.read(ext_len)
                 original_ext = ext_bytes.decode('utf-8')
                 
-                # 서명 검증을 위해 확장자 정보도 업데이트
                 hmac_verify.update(struct.pack('B', ext_len))
                 hmac_verify.update(ext_bytes)
                 
-                # 출력 파일명이 지정되지 않았다면 자동 생성
                 if not output_path:
-                    # 입력파일: report.qcdm -> 출력파일: report.pdf
                     base_name = os.path.splitext(os.path.basename(input_path))[0]
                     output_path = base_name + original_ext
-                    # 만약 확장자 정보가 비어있다면 기본값 사용
                     if not original_ext:
                          output_path += ".restored"
 
                 print(f"📋 감지된 원본 형식: '{original_ext}' -> 복구 대상: {output_path}")
 
-                # 1. 무결성 검증 Loop
                 body_start = f_in.tell()
                 while True:
                     chunk = f_in.read(self.CHUNK_SIZE)
@@ -132,7 +118,6 @@ class QCDM_Smart:
                     print("❌ [오류] 파일이 변조되었거나 비밀번호가 틀렸습니다.")
                     return
 
-                # 2. 복호화 Loop
                 f_in.seek(body_start)
                 decompressor = zlib.decompressobj()
                 chunk_idx = 0
@@ -150,11 +135,12 @@ class QCDM_Smart:
                         chunk_idx += 1
                     
                     f_out.write(decompressor.flush())
-        
-        print(f"✅ 복호화 완료! ({output_path})")
+            
+            # [수정] 이 프린트문도 decrypt 블록 안으로 들여쓰기 했습니다.
+            print(f"✅ 복호화 완료! ({output_path})")
 
 def main():
-    parser = argparse.ArgumentParser(description="QCDM v9.0 - Smart Restore Extension")
+    parser = argparse.ArgumentParser(description="QCDM v9.1 - Final Fixed")
     parser.add_argument("mode", choices=["enc", "dec"], help="enc: 암호화, dec: 복호화")
     parser.add_argument("input_file", help="대상 파일 경로")
     parser.add_argument("-o", "--output", help="저장할 파일 경로 (생략 시 자동 복구)")
@@ -174,7 +160,6 @@ def main():
 
     engine = QCDM_Smart(password)
     try:
-        # output_path를 안 넣으면(None), engine 내부에서 알아서 처리함
         engine.process_file(args.mode == 'enc' and 'encrypt' or 'decrypt', 
                           args.input_file, 
                           args.output)
